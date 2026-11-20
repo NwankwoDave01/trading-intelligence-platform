@@ -15,6 +15,12 @@ from backend.app.data.providers.exceptions import ProviderError, ProviderInvalid
 def mock_exchange():
     exchange = MagicMock(spec=ccxt.binance)
     exchange.id = "binance"
+    exchange.urls = {
+        "api": {
+            "public": "https://data-api.binance.vision/api/v3",
+            "private": "https://api.binance.com/api/v3",
+        }
+    }
     return exchange
 
 
@@ -29,6 +35,31 @@ def test_binance_metadata(binance_provider):
     assert metadata["status"] == "ready"
     assert metadata["default_symbol"] == "BTC/USDT"
     assert metadata["max_candle_limit"] == 1000
+    assert metadata["public_api_url"] == "https://data-api.binance.vision/api/v3"
+
+
+def test_binance_ccxt_url_configuration():
+    """Verify default ccxt.binance instance overrides public API URL to data-api.binance.vision."""
+    provider = BinanceMarketData()
+    ccxt_instance = provider.exchange
+
+    # Verify public API URL routing
+    assert ccxt_instance.urls["api"]["public"] == "https://data-api.binance.vision/api/v3"
+
+    # Verify private and auxiliary endpoints remain standard/unmodified
+    assert ccxt_instance.urls["api"]["private"] == "https://api.binance.com/api/v3"
+    assert "sapi" in ccxt_instance.urls["api"]
+
+    # Verify spot-only options are set to avoid futures/margin network failures on load_markets()
+    assert ccxt_instance.options.get("defaultType") == "spot"
+    assert ccxt_instance.options.get("fetchMarkets") == ["spot"]
+
+
+def test_binance_custom_public_api_url():
+    """Verify custom public API URL can be passed during instantiation."""
+    custom_url = "https://custom-binance-mirror.vision/api/v3"
+    provider = BinanceMarketData(public_api_url=custom_url)
+    assert provider.exchange.urls["api"]["public"] == custom_url
 
 
 def test_binance_get_ticker(binance_provider, mock_exchange):
@@ -70,3 +101,4 @@ def test_binance_backward_compatibility():
     assert isinstance(market_data, BinanceMarketData)
     assert market_data.name == "Binance"
     assert market_data.default_symbol == "BTC/USDT"
+    assert market_data.exchange.urls["api"]["public"] == "https://data-api.binance.vision/api/v3"

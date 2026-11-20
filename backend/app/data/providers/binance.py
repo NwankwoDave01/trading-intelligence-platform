@@ -1,5 +1,6 @@
 """
 Public Binance market data provider implementation.
+Routes public market data requests through https://data-api.binance.vision/api/v3
 Preserves existing functionality while adhering to the BaseMarketDataProvider adapter.
 No API keys are required for these operations.
 """
@@ -14,21 +15,38 @@ from backend.app.data.providers.exceptions import ProviderError, ProviderInvalid
 class BinanceMarketData(BaseMarketDataProvider):
     """
     Public Binance market data provider.
+    Routes public market data requests through https://data-api.binance.vision/api/v3.
     No API keys are required for these operations.
     """
 
     NAME = "Binance"
     DEFAULT_SYMBOL = "BTC/USDT"
     MAX_CANDLE_LIMIT = 1000
+    DEFAULT_PUBLIC_API_URL = "https://data-api.binance.vision/api/v3"
     SUPPORTED_TIMEFRAMES = [
         "1m", "5m", "15m", "30m",
         "1h", "4h", "1d"
     ]
 
-    def __init__(self, exchange: Optional[ccxt.binance] = None, timeout_ms: int = 15000):
+    def __init__(
+        self,
+        exchange: Optional[ccxt.binance] = None,
+        timeout_ms: int = 15000,
+        public_api_url: Optional[str] = None,
+    ):
+        target_public_url = public_api_url or self.DEFAULT_PUBLIC_API_URL
         self.exchange = exchange or ccxt.binance({
             "enableRateLimit": True,
             "timeout": timeout_ms,
+            "options": {
+                "defaultType": "spot",
+                "fetchMarkets": ["spot"],
+            },
+            "urls": {
+                "api": {
+                    "public": target_public_url,
+                },
+            },
         })
 
     @property
@@ -46,6 +64,11 @@ class BinanceMarketData(BaseMarketDataProvider):
     @property
     def max_candle_limit(self) -> int:
         return self.MAX_CANDLE_LIMIT
+
+    def get_metadata(self) -> Dict[str, Any]:
+        data = super().get_metadata()
+        data["public_api_url"] = self.exchange.urls.get("api", {}).get("public")
+        return data
 
     def get_ticker(self, symbol: Optional[str] = "BTC/USDT") -> Dict[str, Any]:
         target_symbol = self.validate_symbol(symbol)
