@@ -347,3 +347,44 @@ In containerized or sandboxed development environments, external DNS resolution 
 ```bash
 python -c "import urllib.request, json; res = urllib.request.urlopen('https://api.kraken.com/0/public/Time', timeout=5); print('Kraken Public Time:', json.loads(res.read()))"
 ```
+
+---
+
+## Signal, Risk, and Paper Trading APIs
+
+The backend now layers three systems over the existing indicator and market-structure services. No private exchange credentials, live orders, margin, or real-money execution are used.
+
+### Signal rules
+
+`GET /api/v1/analysis/signal?symbol=BTC/USD&timeframe=1h&limit=200` returns BUY/SELL/WAIT with weighted factor values, observations, timestamped structure, and reason codes. Weights are structure ±3, EMA20/EMA50 alignment ±2, close relative to EMA20 ±1, MACD line/signal/histogram ±2, RSI context ±1, recent confirmed structural break ±2, and nearby support/resistance context ±1. Zone proximity is within 1% of close; nearby opposing zones subtract one point and favorable context adds one. Zones never trigger a signal by themselves. Recent breaks mean available within 12 completed timeframe bars. Direction requires a bullish/bearish trend, score of at least +6 or at most -6, three aligned non-trend factors, and no opposing scored factor. Ranging/undetermined trends, fewer than 50 completed bars, or missing warm-up values return WAIT. Scores describe rule alignment, not win probability. Signal evaluation excludes the currently unfinished candle and filters structure events by `available_at`.
+
+### Risk preview
+
+`POST /api/v1/risk/preview` accepts direction, entry, stop, target, equity, available cash, and optional risk/exposure limits. Defaults are 1% equity risk, minimum 1.5:1 reward/risk, five open positions, 5% maximum aggregate open risk, 0.1% fee per side, and 1x leverage only. Quantity is rounded down to eight decimal places; estimated entry and exit fees are both included in the loss budget. The service returns a structured rejection reason instead of changing proposed prices.
+
+### Paper account and positions
+
+- `POST /api/v1/paper/account` creates the one local virtual account (subsequent creates retrieve the existing account); `GET /api/v1/paper/account` retrieves it.
+- `POST /api/v1/paper/risk-preview` previews a long proposal against the account and current open risk.
+- `POST /api/v1/paper/positions` opens a long position. Include a unique `idempotency_key` (at least 8 characters) for retry safety.
+- `GET /api/v1/paper/positions` lists open positions; `GET /api/v1/paper/positions/{id}` retrieves one.
+- `POST /api/v1/paper/positions/{id}/mark` updates mark price. Optional `low` and `high` query values supply an OHLC range for stop/target handling.
+- `POST /api/v1/paper/positions/{id}/close` closes once; repeat requests return the existing close record.
+- `GET /api/v1/paper/history`, `/api/v1/paper/performance`, and `/api/v1/paper/positions/{id}/ledger` expose closed trades, reconciled account metrics, and audit entries.
+
+The virtual account stores quote cash in SQLite at `var/paper_trading.sqlite3` (override with `PAPER_TRADING_DB`). SQLite transactions serialize account mutations; the database is local to the application instance and is not a shared/distributed production store. Entry and exit fills apply adverse 0.05% slippage and 0.1% fees. Opening debits unleveraged notional plus entry fee; equity is cash plus marked position value. Net realized P&L includes both fees exactly once. If a supplied candle crosses both protective levels, stop loss wins. Paper trading intentionally supports long positions only; short exposure and leveraged trading are rejected/out of scope until a complete liability and buying-power model exists. Market marks are updated by the caller through the mark endpoint; there is no background polling job.
+
+Example risk request:
+
+```json
+{
+  "direction": "long", "entry": "100", "stop_loss": "95",
+  "take_profit": "110", "equity": "10000", "available_cash": "10000"
+}
+```
+
+Example paper account request:
+
+```json
+{"starting_balance": "10000", "quote_currency": "USD", "risk_percent": "1"}
+```
