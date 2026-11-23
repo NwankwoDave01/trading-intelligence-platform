@@ -8,9 +8,9 @@ Calculation notes
 -----------------
 - SMA: straightforward rolling mean.
 - EMA: seeded with SMA at index (period-1), then k = 2/(N+1) recurrence.
-- RSI: Wilder smoothing (alpha = 1/14); first valid at index (period*2 - 1).
-- MACD: EMA(12) - EMA(26); signal = EMA(MACD,9).
-- Bollinger: SMA ± 2 × sample std (ddof=1).
+- RSI: Wilder smoothing; first valid at index period.
+- MACD: EMA(12) - EMA(26); signal is a 9-period SMA-seeded EMA of valid MACD.
+- Bollinger: SMA ± 2 × population std (ddof=0).
 - ATR: Wilder smoothing; first valid at index period.
 """
 
@@ -139,16 +139,12 @@ class TestEMA:
         assert math.isnan(result[1])
 
     def test_ema_recurrence(self):
-        # EMA(2) of [10,11,12]
-        # k = 2/3
-        # seed = 10
-        # idx1: 11 * 2/3 + 10 * 1/3 = 7.333+3.333 = 10.667
-        # idx2: 12 * 2/3 + 10.667 * 1/3 = 8+3.556 = 11.556
+        # SMA seed of [10,11] at index 1, then alpha=2/3 recurrence.
         closes = [10.0, 11.0, 12.0]
         result = ema(closes, 2)
-        assert result[0] == pytest.approx(10.0)
-        assert result[1] == pytest.approx(10.0 + 2 / 3 * (11.0 - 10.0))
-        assert result[2] == pytest.approx(result[1] + 2 / 3 * (12.0 - result[1]))
+        assert math.isnan(result[0])
+        assert result[1] == pytest.approx(10.5)
+        assert result[2] == pytest.approx(10.5 + 2 / 3 * (12.0 - 10.5))
 
     def test_ema_all_nan_when_too_short(self):
         result = ema([1.0, 2.0], 5)
@@ -170,15 +166,22 @@ class TestEMA:
 # ---------------------------------------------------------------------------
 
 class TestRSI:
-    def test_flat_series_rsi_is_nan(self):
-        """All-flat prices → all gains = all losses = 0 → RSI undefined."""
+    def test_flat_series_rsi_is_neutral(self):
         closes = make_flat(100.0, 30)
         result = rsi(closes, 14)
-        # avg_loss stays 0, so RSI = 100 (division guard) or NaN; we emit 100
-        # for the degenerate no-loss case; check finite values are 100
-        for v in result:
-            if not math.isnan(v):
-                assert v == pytest.approx(100.0)
+        assert math.isnan(result[13])
+        assert result[14] == pytest.approx(50.0)
+        assert all(value == pytest.approx(50.0) for value in result[14:])
+
+    def test_wilder_seed_and_recurrence_match_hand_calculation(self):
+        closes = [10.0, 11.0, 10.0, 12.0, 11.0]
+        result = rsi(closes, 3)
+        # Changes [1,-1,2] seed avg gain=1, avg loss=1/3.
+        assert math.isnan(result[2])
+        assert result[3] == pytest.approx(75.0)
+        # Next change is -1: avg gain=2/3, avg loss=5/9.
+        expected = 100.0 - 100.0 / (1.0 + (2.0 / 3.0) / (5.0 / 9.0))
+        assert result[4] == pytest.approx(expected)
 
     def test_all_rising_rsi_approaches_100(self):
         closes = make_linear(100.0, 1.0, 50)
@@ -235,12 +238,30 @@ class TestMACD:
         for i in range(33):
             assert math.isnan(signal_line[i])
 
+    def test_first_valid_macd_signal_and_histogram_values(self):
+        closes = make_linear(100.0, 1.0, 40)
+        line, signal, histogram = macd(closes)
+        assert math.isnan(line[24])
+        assert line[25] == pytest.approx(7.0)
+        assert math.isnan(signal[32])
+        assert signal[33] == pytest.approx(np.mean(line[25:34]))
+        assert histogram[33] == pytest.approx(line[33] - signal[33])
+
     def test_macd_line_direction(self):
-        """In a rising market fast EMA > slow EMA, so MACD line > 0."""
         closes = make_linear(100.0, 1.0, 100)
-        macd_line, _, _ = macd(closes, 12, 26, 9)
-        finite = [v for v in macd_line if not math.isnan(v)]
-        assert all(v > 0 for v in finite)
+        line, _, _ = macd(closes)
+        assert all(value > 0 for value in line[25:])
+
+    def test_falling_market_macd_line_is_negative(self):
+        closes = make_linear(200.0, -1.0, 100)
+        line, _, _ = macd(closes)
+        assert all(value < 0 for value in line[25:])
+
+    def test_macd_insufficient_signal_history(self):
+        line, signal, histogram = macd(make_linear(10.0, 1.0, 33))
+        assert not math.isnan(line[-1])
+        assert math.isnan(signal[-1])
+        assert math.isnan(histogram[-1])
 
     def test_macd_histogram_equals_line_minus_signal(self):
         closes = make_linear(100.0, 0.3, 100)
@@ -296,14 +317,12 @@ class TestBollingerBands:
             assert lower[i] == pytest.approx(100.0, abs=1e-9)
 
     def test_known_std_value(self):
-        # Window of 5 values: [2,4,4,4,5,5,7,9] (n=8)
-        # At index 4 (period=5): window=[2,4,4,4,5]
-        # mean=3.8, sample std=sqrt(((2-3.8)^2+(4-3.8)^2*3+(5-3.8)^2)/4)
+        # At index 4 (period=5), use population standard deviation.
         closes = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
         upper, middle, lower = bollinger_bands(closes, 5, 2.0)
         window_at_4 = [2.0, 4.0, 4.0, 4.0, 5.0]
         m = np.mean(window_at_4)
-        s = np.std(window_at_4, ddof=1)
+        s = np.std(window_at_4, ddof=0)
         assert middle[4] == pytest.approx(m, rel=1e-9)
         assert upper[4] == pytest.approx(m + 2 * s, rel=1e-9)
         assert lower[4] == pytest.approx(m - 2 * s, rel=1e-9)

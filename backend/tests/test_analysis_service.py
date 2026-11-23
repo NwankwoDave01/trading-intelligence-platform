@@ -186,16 +186,53 @@ class TestMalformedInput:
 
     def test_non_finite_close(self):
         candles = [
-            {"timestamp": 1000, "open": 1.0, "high": 2.0, "low": 0.5, "close": float("nan")},
-            {"timestamp": 2000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5},
+            {"timestamp": 1000, "open": 1.0, "high": 2.0, "low": 0.5, "close": float("nan"), "volume": 1.0},
+            {"timestamp": 2000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0},
         ]
         with pytest.raises(ValueError, match="non-finite"):
             calculate_indicators(candles)
 
     def test_non_finite_high(self):
         candles = [
-            {"timestamp": 1000, "open": 1.0, "high": float("inf"), "low": 0.5, "close": 1.2},
-            {"timestamp": 2000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5},
+            {"timestamp": 1000, "open": 1.0, "high": float("inf"), "low": 0.5, "close": 1.2, "volume": 1.0},
+            {"timestamp": 2000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0},
         ]
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="non-finite"):
             calculate_indicators(candles)
+
+    @pytest.mark.parametrize("field,value,match", [
+        ("volume", float("nan"), "non-finite"),
+        ("volume", -1.0, "negative volume"),
+        ("high", 98.0, "high below low"),
+        ("open", 200.0, "outside"),
+        ("close", 200.0, "outside"),
+    ])
+    def test_rejects_invalid_ohlcv(self, field, value, match):
+        candles = _make_candles(2)
+        candles[0][field] = value
+        with pytest.raises(ValueError, match=match):
+            calculate_indicators(candles)
+
+    @pytest.mark.parametrize("timestamps,match", [
+        ([1000, 1000], "duplicated"),
+        ([2000, 1000], "chronological"),
+        ([1000, -1], "negative"),
+        ([1000, 1.5], "integer"),
+    ])
+    def test_rejects_invalid_timestamps(self, timestamps, match):
+        candles = _make_candles(2)
+        for candle, timestamp in zip(candles, timestamps):
+            candle["timestamp"] = timestamp
+        with pytest.raises(ValueError, match=match):
+            calculate_indicators(candles)
+
+    def test_rejects_invalid_indicator_periods(self):
+        with pytest.raises(ValueError, match="period"):
+            calculate_indicators(_make_candles(5), rsi_period=0)
+        with pytest.raises(ValueError, match="less than"):
+            calculate_indicators(_make_candles(5), macd_fast=26, macd_slow=12)
+
+    def test_short_valid_history_keeps_warmup_nulls(self):
+        result = calculate_indicators(_make_candles(2))
+        assert all(row["ema_50"] is None for row in result["series"])
+        assert all(row["macd"]["line"] is None for row in result["series"])

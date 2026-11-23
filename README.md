@@ -190,6 +190,99 @@ Interactive documentation is available at:
 }
 ```
 
+### 5. Technical Analysis Indicators
+- **Endpoint**: `GET /api/v1/analysis/indicators`
+- **Query parameters**: `symbol` (provider default if omitted), `timeframe` (default `1h`), and `limit` (default `200`; provider limits apply).
+- The endpoint validates every candle's OHLCV fields, finite numeric values, candle price bounds, non-negative volume, and strictly increasing unique integer timestamps. Invalid data receives HTTP 422; insufficient individual indicator warm-up history is represented by `null`, without inventing market data.
+- **Features**: SMA(20/50), EMA(20/50), Wilder RSI(14), MACD(12,26,9), Bollinger Bands(20,2), and Wilder ATR(14).
+- **Calculation conventions**:
+  - EMA is seeded with the SMA of its first N observations, first valid at index N−1, then uses alpha = 2/(N+1).
+  - RSI uses the first 14 price changes to seed average gains/losses, first valid at index 14, and Wilder recurrence (previous average × 13 + current change)/14. No gain and no loss maps to neutral RSI 50.
+  - MACD uses 12- and 26-period SMA-seeded EMAs. Its signal is a 9-period SMA-seeded EMA of valid MACD values only; histogram = line − signal. First MACD line is at index 25 and first signal at index 33.
+  - Bollinger middle is SMA(20); upper/lower are middle ± 2 population standard deviations (ddof=0).
+  - ATR uses Wilder smoothing, seeded by 14 true ranges at index 14.
+- **Example response** (values abbreviated):
+```json
+{
+  "exchange": "Kraken",
+  "symbol": "BTC/USD",
+  "timeframe": "1h",
+  "candle_count": 100,
+  "latest": {
+    "sma_20": 94000.0,
+    "sma_50": 93800.0,
+    "ema_20": 94010.0,
+    "ema_50": 93900.0,
+    "rsi_14": 55.2,
+    "macd": {"line": 12.5, "signal": 10.2, "histogram": 2.3},
+    "bollinger_bands": {"upper": 95000.0, "middle": 94000.0, "lower": 93000.0},
+    "atr_14": 450.0
+  },
+  "series": [{"timestamp": 1700000000000, "close": 93400.0, "sma_20": null, "sma_50": null, "ema_20": null, "ema_50": null, "rsi_14": null, "macd": {"line": null, "signal": null, "histogram": null}, "bollinger_bands": {"upper": null, "middle": null, "lower": null}, "atr_14": null}]
+}
+```
+
+### 6. Market Structure Analysis
+
+- **Endpoint**: `GET /api/v1/analysis/market-structure`
+- **Query parameters**: `symbol` (optional; defaults to provider default), `timeframe` (default `1h`), `limit` (default `200`; must not exceed the active provider maximum), `left_bars` and `right_bars` (defaults `3`, each `1–50`), `break_buffer` (default `0`, absolute price units), and `level_tolerance` (default `0`, absolute price units).
+- The route uses the existing provider dependency and excludes a final candle whose interval has not closed yet. It returns HTTP 400 for unsupported timeframes or provider-limit violations and HTTP 422 for invalid OHLCV/configuration.
+
+#### Methodology and confirmation timing
+
+- A swing high/low must be strictly higher/lower than every neighbor in the configured left and right windows. Equal highs/lows disqualify tied candidates. A swing is emitted only once all right-side candles are closed; its `timestamp` is the pivot candle open time, `confirmation_candle_timestamp` identifies the final confirming candle, and `available_at` is that candle's estimated close time.
+- Each high is compared only with the preceding high, and each low only with the preceding low. The first comparable pivot has no classification. Subsequent highs are HH/LH; subsequent lows are HL/LL. `reference_swing_id` identifies the prior point used.
+- Trend uses confirmed swings only. It is bullish when the latest classified high is HH and latest classified low is HL; bearish when they are LH and LL. Once both sides have comparable pivots but do not agree, the state is ranging; before that it is undetermined. A single higher high is not sufficient for a bullish trend.
+- A structural level is the latest confirmed swing high/low, available before the break candle. A candle close crossing that level plus/minus `break_buffer` produces BOS when aligned with established trend and CHoCH when opposed. No BOS/CHoCH is emitted while trend is ranging or undetermined. A level/direction pair emits at most one event; a new confirmed pivot creates a new level. The latest candle's wick-only crossing is returned separately as an `unconfirmed` potential break, never as a confirmed event.
+- Support uses confirmed swing lows and resistance uses confirmed swing highs. Clustering uses an absolute price tolerance from the first pivot in each cluster; each new pivot joins the nearest matching anchor (ties choose the earliest cluster). Zones expose bounds, source pivots, confirmation/availability times, and contributing-point count; the count is not a strength score.
+- Historical results never make a pivot available before its right-side confirmation or a break before its closing candle. The route discards an unfinished latest candle; results assume earlier provider candles are closed. `available_at` is estimated from the fixed timeframe duration.
+
+#### Example request
+
+```http
+GET /api/v1/analysis/market-structure?symbol=BTC%2FUSD&timeframe=1h&limit=200&left_bars=3&right_bars=3&break_buffer=0&level_tolerance=50
+```
+
+#### Example response (abbreviated)
+
+```json
+{
+  "exchange": "Kraken",
+  "symbol": "BTC/USD",
+  "timeframe": "1h",
+  "candle_count": 200,
+  "as_of": 1700003600000,
+  "trend": {"classification": "bullish", "as_of": 1700003600000},
+  "confirmed_swings": [{
+    "id": "high:42", "swing_type": "high", "timestamp": 1699990000000,
+    "price": 94000.0, "confirmation_candle_timestamp": 1699996400000,
+    "available_at": 1700000000000, "confirmation_delay_bars": 3,
+    "classification": "HH", "reference_swing_id": "high:35"
+  }],
+  "break_events": [{
+    "id": "bos:high:42:47", "event_type": "BOS", "direction": "bullish",
+    "broken_level": 94000.0, "source_swing_id": "high:42",
+    "source_swing_timestamp": 1699990000000,
+    "confirmation_candle_timestamp": 1700000000000,
+    "confirmation_close": 94100.0, "available_at": 1700003600000
+  }],
+  "potential_breaks": [],
+  "zones": [{
+    "zone_type": "support", "lower_bound": 92000.0, "upper_bound": 92025.0,
+    "midpoint": 92012.5, "tolerance": 50.0, "contributing_swings": 2,
+    "source_swing_ids": ["low:30", "low:38"],
+    "source_timestamps": [1699940000000, 1699968800000],
+    "confirmation_timestamps": [1699950800000, 1699979600000],
+    "first_available_at": 1699954400000, "last_available_at": 1699983200000
+  }],
+  "configuration": {
+    "left_bars": 3, "right_bars": 3, "break_buffer": 0.0,
+    "level_tolerance": 50.0, "break_confirmation": "candle_close",
+    "tie_handling": "equal neighboring highs/lows disqualify a pivot"
+  }
+}
+```
+
 ---
 
 ## Error Handling & Status Codes
@@ -213,10 +306,10 @@ The automated test suite runs completely offline with **zero external network re
 
 ```bash
 # Run the entire test suite
-pytest backend/tests -v
+.venv/bin/python -m pytest backend/tests/ -v
 
 # Run tests with short summary
-pytest backend/tests -q
+.venv/bin/python -m pytest backend/tests/ -q
 ```
 
 ### Test Coverage Areas:
@@ -240,6 +333,10 @@ pytest backend/tests -q
    - Parameter validation (timeframe and candle limits).
    - HTTP status code mapping (400, 404, 429, 502, 503, 504).
    - Dynamic exchange switching via dependency injection.
+5. **`test_market_structure.py`** and **`test_market_structure_api.py`**:
+   - Pivot ties and confirmation delays, HH/HL/LH/LL labels, all trend states.
+   - Close-confirmed BOS/CHoCH, wick-only potential breaks, buffers, and duplicate prevention.
+   - Zone clustering, malformed OHLCV/timestamps, provider injection, candle caps, and unfinished-candle exclusion.
 
 ---
 

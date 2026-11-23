@@ -4,6 +4,7 @@ uvicorn[standard]>=0.30.0
 
 # Market Data & CCXT Exchange Integration
 ccxt>=4.4.0
+numpy>=1.26.0
 
 # Configuration & Validation
 pydantic>=2.8.0
