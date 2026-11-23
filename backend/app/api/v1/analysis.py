@@ -106,7 +106,7 @@ def get_indicators(
     - **EMA** 20 and 50 periods
     - **RSI** 14 periods (Wilder smoothing)
     - **MACD** (12/26/9) — line, signal, histogram
-    - **Bollinger Bands** (20, 2σ sample std) — upper, middle, lower
+    - **Bollinger Bands** (20, 2σ population std, ddof=0) — upper, middle, lower
     - **ATR** 14 periods (Wilder smoothing)
     """
     target_symbol = symbol or provider.default_symbol
@@ -121,15 +121,21 @@ def get_indicators(
             ),
         )
 
-    # Respect provider candle caps (Kraken: 720)
-    effective_limit = min(limit, provider.max_candle_limit)
+    if limit > provider.max_candle_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested limit {limit} exceeds maximum allowed of "
+                f"{provider.max_candle_limit} for {provider.name}."
+            ),
+        )
 
     # --- Fetch candles ---
     try:
         candles = provider.get_candles(
             symbol=target_symbol,
             timeframe=timeframe,
-            limit=effective_limit,
+            limit=limit,
         )
     except Exception as exc:
         _handle_provider_exception(exc, provider.name)

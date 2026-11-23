@@ -192,7 +192,7 @@ Interactive documentation is available at:
 
 ### 5. Technical Analysis Indicators
 - **Endpoint**: `GET /api/v1/analysis/indicators`
-- **Query parameters**: `symbol` (provider default if omitted), `timeframe` (default `1h`), and `limit` (default `100`; provider limits apply).
+- **Query parameters**: `symbol` (provider default if omitted), `timeframe` (default `1h`), and `limit` (default `200`; provider limits apply).
 - The endpoint validates every candle's OHLCV fields, finite numeric values, candle price bounds, non-negative volume, and strictly increasing unique integer timestamps. Invalid data receives HTTP 422; insufficient individual indicator warm-up history is represented by `null`, without inventing market data.
 - **Features**: SMA(20/50), EMA(20/50), Wilder RSI(14), MACD(12,26,9), Bollinger Bands(20,2), and Wilder ATR(14).
 - **Calculation conventions**:

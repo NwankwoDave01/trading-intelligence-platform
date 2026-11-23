@@ -176,6 +176,11 @@ class TestIndicatorEndpointValidation:
         call_kwargs = mock_provider.get_candles.call_args
         assert call_kwargs.kwargs["symbol"] == "ETH/USDT"
 
+    def test_binance_provider_accepts_its_1000_candle_limit(self, client, mock_provider):
+        response = client.get("/api/v1/analysis/indicators?limit=1000")
+        assert response.status_code == 200
+        assert mock_provider.get_candles.call_args.kwargs["limit"] == 1000
+
     def test_custom_timeframe_passed_to_provider(self, client, mock_provider):
         client.get("/api/v1/analysis/indicators?timeframe=4h")
         call_kwargs = mock_provider.get_candles.call_args
@@ -217,6 +222,22 @@ class TestIndicatorEndpointErrors:
 # ---------------------------------------------------------------------------
 
 class TestIndicatorEndpointWithKrakenProvider:
+    def test_kraken_limit_above_provider_cap_returns_400(self):
+        kraken_provider = MagicMock(spec=BaseMarketDataProvider)
+        kraken_provider.name = "Kraken"
+        kraken_provider.default_symbol = "BTC/USD"
+        kraken_provider.supported_timeframes = ["1h"]
+        kraken_provider.max_candle_limit = 720
+        app.dependency_overrides[get_active_provider] = lambda: kraken_provider
+        try:
+            with TestClient(app) as client:
+                response = client.get("/api/v1/analysis/indicators?limit=721")
+            assert response.status_code == 400
+            assert response.json()["detail"] == "Requested limit 721 exceeds maximum allowed of 720 for Kraken."
+            kraken_provider.get_candles.assert_not_called()
+        finally:
+            app.dependency_overrides.clear()
+
     def test_kraken_provider_injection(self):
         kraken_candles = _make_candles(200, start=94000.0, step=0.3)
         kraken_provider = MagicMock(spec=BaseMarketDataProvider)
