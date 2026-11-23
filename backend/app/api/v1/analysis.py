@@ -12,12 +12,15 @@ abstraction — this module contains no exchange-specific logic.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 import ccxt
 
 from backend.app.analysis.service import calculate_indicators, MIN_CANDLES
+from backend.app.analysis.market_structure import calculate_market_structure
+from backend.app.analysis.market_structure.service import timeframe_to_milliseconds
 from backend.app.data.providers.base import BaseMarketDataProvider
 from backend.app.data.providers.factory import get_active_provider
 from backend.app.data.providers.exceptions import (
@@ -29,6 +32,7 @@ from backend.app.data.providers.exceptions import (
     ProviderUnavailableError,
 )
 from backend.app.schemas.analysis import IndicatorResponse
+from backend.app.schemas.market_structure import MarketStructureResponse
 
 logger = logging.getLogger(__name__)
 
@@ -162,4 +166,71 @@ def get_indicators(
         candle_count=result["candle_count"],
         latest=result["latest"],
         series=result["series"],
+    )
+
+
+@router.get(
+    "/market-structure",
+    response_model=MarketStructureResponse,
+    summary="Analyze market structure",
+    description=(
+        "Returns confirmed swing points, structural classifications, close-confirmed "
+        "BOS/CHoCH events, trend state, and clustered support/resistance zones. "
+        "Swing and event availability timestamps include confirmation delays."
+    ),
+)
+def get_market_structure(
+    symbol: Optional[str] = Query(default=None, description="Trading pair; defaults to the active provider's default pair."),
+    timeframe: str = Query(default="1h", description="Provider-supported candle interval."),
+    limit: int = Query(default=200, ge=_ANALYSIS_MIN_LIMIT, le=_ANALYSIS_MAX_LIMIT),
+    left_bars: int = Query(default=3, ge=1, le=50),
+    right_bars: int = Query(default=3, ge=1, le=50),
+    break_buffer: float = Query(default=0.0, ge=0.0),
+    level_tolerance: float = Query(default=0.0, ge=0.0),
+    provider: BaseMarketDataProvider = Depends(get_active_provider),
+) -> MarketStructureResponse:
+    target_symbol = symbol or provider.default_symbol
+    if timeframe not in provider.supported_timeframes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported timeframe '{timeframe}' for {provider.name}. "
+                f"Supported: {', '.join(provider.supported_timeframes)}."
+            ),
+        )
+    if limit > provider.max_candle_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested limit {limit} exceeds maximum allowed of "
+                f"{provider.max_candle_limit} for {provider.name}."
+            ),
+        )
+
+    try:
+        candles = provider.get_candles(symbol=target_symbol, timeframe=timeframe, limit=limit)
+    except Exception as exc:
+        _handle_provider_exception(exc, provider.name)
+
+    try:
+        timeframe_ms = timeframe_to_milliseconds(timeframe)
+        now_ms = time.time_ns() // 1_000_000
+        if candles and int(candles[-1]["timestamp"]) + timeframe_ms > now_ms:
+            candles = candles[:-1]
+        result = calculate_market_structure(
+            candles,
+            timeframe=timeframe,
+            left_bars=left_bars,
+            right_bars=right_bars,
+            break_buffer=break_buffer,
+            level_tolerance=level_tolerance,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return MarketStructureResponse(
+        exchange=provider.name,
+        symbol=target_symbol,
+        timeframe=timeframe,
+        **result,
     )
