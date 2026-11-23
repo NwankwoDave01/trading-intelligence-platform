@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 class MACDValues(BaseModel):
     line: Optional[float] = Field(None, description="MACD line (EMA fast − EMA slow)")
-    signal: Optional[float] = Field(None, description="Signal line (EMA of MACD line)")
+    signal: Optional[float] = Field(None, description="9-period SMA-seeded EMA of valid MACD observations")
     histogram: Optional[float] = Field(None, description="MACD histogram (line − signal)")
 
 
@@ -31,7 +31,7 @@ class LatestIndicators(BaseModel):
     rsi_14: Optional[float] = Field(None, description="Relative Strength Index, 14 periods (Wilder smoothing)")
     macd: MACDValues = Field(default_factory=MACDValues, description="MACD indicator values")
     bollinger_bands: BollingerBandValues = Field(
-        default_factory=BollingerBandValues, description="Bollinger Bands (period 20, 2σ sample std)"
+        default_factory=BollingerBandValues, description="Bollinger Bands (period 20, 2σ population std, ddof=0)"
     )
     atr_14: Optional[float] = Field(None, description="Average True Range, 14 periods (Wilder smoothing)")
 

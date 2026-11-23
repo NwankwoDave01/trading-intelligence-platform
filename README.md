@@ -190,6 +190,38 @@ Interactive documentation is available at:
 }
 ```
 
+### 5. Technical Analysis Indicators
+- **Endpoint**: `GET /api/v1/analysis/indicators`
+- **Query parameters**: `symbol` (provider default if omitted), `timeframe` (default `1h`), and `limit` (default `100`; provider limits apply).
+- The endpoint validates every candle's OHLCV fields, finite numeric values, candle price bounds, non-negative volume, and strictly increasing unique integer timestamps. Invalid data receives HTTP 422; insufficient individual indicator warm-up history is represented by `null`, without inventing market data.
+- **Features**: SMA(20/50), EMA(20/50), Wilder RSI(14), MACD(12,26,9), Bollinger Bands(20,2), and Wilder ATR(14).
+- **Calculation conventions**:
+  - EMA is seeded with the SMA of its first N observations, first valid at index N−1, then uses alpha = 2/(N+1).
+  - RSI uses the first 14 price changes to seed average gains/losses, first valid at index 14, and Wilder recurrence (previous average × 13 + current change)/14. No gain and no loss maps to neutral RSI 50.
+  - MACD uses 12- and 26-period SMA-seeded EMAs. Its signal is a 9-period SMA-seeded EMA of valid MACD values only; histogram = line − signal. First MACD line is at index 25 and first signal at index 33.
+  - Bollinger middle is SMA(20); upper/lower are middle ± 2 population standard deviations (ddof=0).
+  - ATR uses Wilder smoothing, seeded by 14 true ranges at index 14.
+- **Example response** (values abbreviated):
+```json
+{
+  "exchange": "Kraken",
+  "symbol": "BTC/USD",
+  "timeframe": "1h",
+  "candle_count": 100,
+  "latest": {
+    "sma_20": 94000.0,
+    "sma_50": 93800.0,
+    "ema_20": 94010.0,
+    "ema_50": 93900.0,
+    "rsi_14": 55.2,
+    "macd": {"line": 12.5, "signal": 10.2, "histogram": 2.3},
+    "bollinger_bands": {"upper": 95000.0, "middle": 94000.0, "lower": 93000.0},
+    "atr_14": 450.0
+  },
+  "series": [{"timestamp": 1700000000000, "close": 93400.0, "sma_20": null, "sma_50": null, "ema_20": null, "ema_50": null, "rsi_14": null, "macd": {"line": null, "signal": null, "histogram": null}, "bollinger_bands": {"upper": null, "middle": null, "lower": null}, "atr_14": null}]
+}
+```
+
 ---
 
 ## Error Handling & Status Codes
@@ -213,10 +245,10 @@ The automated test suite runs completely offline with **zero external network re
 
 ```bash
 # Run the entire test suite
-pytest backend/tests -v
+.venv/bin/python -m pytest backend/tests/ -v
 
 # Run tests with short summary
-pytest backend/tests -q
+.venv/bin/python -m pytest backend/tests/ -q
 ```
 
 ### Test Coverage Areas:

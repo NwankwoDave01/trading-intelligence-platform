@@ -1,44 +1,23 @@
-"""
-Technical analysis service.
-
-Receives a list of normalised OHLCV candle dicts (as returned by the market
-data providers) and produces a fully-structured IndicatorResult.
-
-This module is intentionally decoupled from FastAPI and from exchange
-providers: it has no network dependencies and is independently testable.
-"""
+"""Validate normalized OHLCV candles and calculate aligned indicators."""
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any
 
 import numpy as np
 
 from backend.app.analysis.indicators import (
-    _safe_array,
-    _safe_scalar,
-    atr,
-    bollinger_bands,
-    ema,
-    macd,
-    rsi,
-    sma,
+    _safe_array, atr, bollinger_bands, ema, macd, rsi, sma,
 )
 
-# Minimum number of candles we need before we will attempt indicator
-# calculation at all.  Below this we raise ValueError so the API layer can
-# return a sensible 422.
 MIN_CANDLES = 2
 
 
 def _extract_ohlcv(
     candles: list[dict[str, Any]],
-) -> tuple[list[int], list[float], list[float], list[float], list[float]]:
-    """
-    Pull timestamps and OHLCV columns out of provider candle dicts.
-
-    Raises ValueError for empty input or structurally invalid candles.
-    """
+) -> tuple[list[int], list[float], list[float], list[float], list[float], list[float]]:
+    """Validate candle structure, chronological timestamps, and OHLCV values."""
     if not candles:
         raise ValueError("Candle list is empty; cannot calculate indicators.")
 
@@ -47,32 +26,68 @@ def _extract_ohlcv(
     highs: list[float] = []
     lows: list[float] = []
     closes: list[float] = []
+    volumes: list[float] = []
+    seen_timestamps: set[int] = set()
 
-    for idx, c in enumerate(candles):
+    for index, candle in enumerate(candles):
+        if not isinstance(candle, dict):
+            raise ValueError(f"Candle at index {index} must be an object.")
         try:
-            ts = c["timestamp"]
-            o = float(c["open"])
-            h = float(c["high"])
-            lo = float(c["low"])
-            cl = float(c["close"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Candle at index {idx} is malformed or missing required fields: {exc}"
-            ) from exc
+            timestamp = candle["timestamp"]
+            if isinstance(timestamp, bool) or not isinstance(timestamp, Integral):
+                raise ValueError("timestamp must be an integer")
+            timestamp = int(timestamp)
+            values = [float(candle[key]) for key in ("open", "high", "low", "close", "volume")]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Candle at index {index} is malformed or missing required fields: {exc}") from exc
 
-        # Reject non-finite price values
-        if not all(np.isfinite([o, h, lo, cl])):
-            raise ValueError(
-                f"Candle at index {idx} contains non-finite price value(s)."
-            )
+        open_price, high, low, close, volume = values
+        if not all(np.isfinite(values)):
+            raise ValueError(f"Candle at index {index} contains non-finite OHLCV value(s).")
+        if timestamp < 0:
+            raise ValueError(f"Candle at index {index} has a negative timestamp.")
+        if timestamp in seen_timestamps:
+            raise ValueError(f"Candle timestamp {timestamp} is duplicated.")
+        if timestamps and timestamp <= timestamps[-1]:
+            raise ValueError("Candle timestamps must be in strictly chronological order.")
+        if high < low:
+            raise ValueError(f"Candle at index {index} has high below low.")
+        if not low <= open_price <= high or not low <= close <= high:
+            raise ValueError(f"Candle at index {index} has open or close outside the high/low range.")
+        if volume < 0:
+            raise ValueError(f"Candle at index {index} has negative volume.")
 
-        timestamps.append(ts)
-        opens.append(o)
-        highs.append(h)
-        lows.append(lo)
-        closes.append(cl)
+        timestamps.append(timestamp)
+        seen_timestamps.add(timestamp)
+        opens.append(open_price)
+        highs.append(high)
+        lows.append(low)
+        closes.append(close)
+        volumes.append(volume)
 
-    return timestamps, opens, highs, lows, closes
+    return timestamps, opens, highs, lows, closes, volumes
+
+
+def _validate_calculation_parameters(
+    sma_periods: tuple[int, int], ema_periods: tuple[int, int], rsi_period: int,
+    macd_fast: int, macd_slow: int, macd_signal: int, bb_period: int,
+    bb_std: float, atr_period: int,
+) -> None:
+    for label, pair in (("SMA", sma_periods), ("EMA", ema_periods)):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError(f"{label} periods must contain exactly two positive integers.")
+        for period in pair:
+            if isinstance(period, bool) or not isinstance(period, Integral) or period < 1:
+                raise ValueError(f"{label} periods must contain exactly two positive integers.")
+    for label, period in (("RSI", rsi_period), ("MACD fast", macd_fast), ("MACD slow", macd_slow),
+                          ("MACD signal", macd_signal), ("Bollinger", bb_period), ("ATR", atr_period)):
+        minimum = 2 if label == "Bollinger" else 1
+        if isinstance(period, bool) or not isinstance(period, Integral) or period < minimum:
+            raise ValueError(f"{label} period must be an integer >= {minimum}.")
+    if macd_fast >= macd_slow:
+        raise ValueError("MACD fast period must be less than slow period.")
+    if isinstance(bb_std, bool) or not np.isfinite(bb_std) or bb_std < 0:
+        raise ValueError("Bollinger standard-deviation multiplier must be finite and non-negative.")
 
 
 def calculate_indicators(
@@ -87,105 +102,43 @@ def calculate_indicators(
     bb_std: float = 2.0,
     atr_period: int = 14,
 ) -> dict[str, Any]:
-    """
-    Calculate all technical indicators for a list of OHLCV candles.
-
-    Parameters
-    ----------
-    candles:
-        List of dicts with keys ``timestamp``, ``open``, ``high``, ``low``,
-        ``close``, ``volume`` (as returned by market data providers).
-
-    Returns
-    -------
-    dict with keys:
-        ``candle_count``   – number of input candles
-        ``latest``         – dict of the most-recent finite indicator values
-        ``series``         – timestamp-aligned list of per-candle indicator dicts
-    """
+    """Calculate SMA, EMA, Wilder RSI/MACD, Bollinger Bands, and Wilder ATR."""
+    timestamps, _opens, highs, lows, closes, _volumes = _extract_ohlcv(candles)
     if len(candles) < MIN_CANDLES:
-        raise ValueError(
-            f"At least {MIN_CANDLES} candles are required; received {len(candles)}."
-        )
+        raise ValueError(f"At least {MIN_CANDLES} candles are required; received {len(candles)}.")
+    _validate_calculation_parameters(
+        sma_periods, ema_periods, rsi_period, macd_fast, macd_slow,
+        macd_signal, bb_period, bb_std, atr_period,
+    )
 
-    timestamps, opens, highs, lows, closes = _extract_ohlcv(candles)
-
-    # --- Moving averages ---
-    sma20 = sma(closes, sma_periods[0])
-    sma50 = sma(closes, sma_periods[1])
-    ema20 = ema(closes, ema_periods[0])
-    ema50 = ema(closes, ema_periods[1])
-
-    # --- Momentum ---
-    rsi14 = rsi(closes, rsi_period)
+    arrays = {
+        "sma_20": sma(closes, sma_periods[0]),
+        "sma_50": sma(closes, sma_periods[1]),
+        "ema_20": ema(closes, ema_periods[0]),
+        "ema_50": ema(closes, ema_periods[1]),
+        "rsi_14": rsi(closes, rsi_period),
+    }
     macd_line, signal_line, macd_hist = macd(closes, macd_fast, macd_slow, macd_signal)
-
-    # --- Volatility ---
     bb_upper, bb_middle, bb_lower = bollinger_bands(closes, bb_period, bb_std)
-    atr14 = atr(highs, lows, closes, atr_period)
+    atr_values = atr(highs, lows, closes, atr_period)
+    arrays = {key: _safe_array(value) for key, value in arrays.items()}
+    macd_values = [_safe_array(value) for value in (macd_line, signal_line, macd_hist)]
+    bands = [_safe_array(value) for value in (bb_upper, bb_middle, bb_lower)]
+    atr_list = _safe_array(atr_values)
 
-    # Convert to safe lists
-    sma20_list = _safe_array(sma20)
-    sma50_list = _safe_array(sma50)
-    ema20_list = _safe_array(ema20)
-    ema50_list = _safe_array(ema50)
-    rsi14_list = _safe_array(rsi14)
-    macd_line_list = _safe_array(macd_line)
-    signal_line_list = _safe_array(signal_line)
-    macd_hist_list = _safe_array(macd_hist)
-    bb_upper_list = _safe_array(bb_upper)
-    bb_middle_list = _safe_array(bb_middle)
-    bb_lower_list = _safe_array(bb_lower)
-    atr14_list = _safe_array(atr14)
-
-    n = len(candles)
-
-    # --- Build timestamp-aligned series ---
     series = []
-    for i in range(n):
+    for index, close in enumerate(closes):
         series.append({
-            "timestamp": timestamps[i],
-            "close": closes[i],
-            "sma_20": sma20_list[i],
-            "sma_50": sma50_list[i],
-            "ema_20": ema20_list[i],
-            "ema_50": ema50_list[i],
-            "rsi_14": rsi14_list[i],
-            "macd": {
-                "line": macd_line_list[i],
-                "signal": signal_line_list[i],
-                "histogram": macd_hist_list[i],
-            },
-            "bollinger_bands": {
-                "upper": bb_upper_list[i],
-                "middle": bb_middle_list[i],
-                "lower": bb_lower_list[i],
-            },
-            "atr_14": atr14_list[i],
+            "timestamp": timestamps[index], "close": close,
+            **{key: values[index] for key, values in arrays.items()},
+            "macd": {"line": macd_values[0][index], "signal": macd_values[1][index], "histogram": macd_values[2][index]},
+            "bollinger_bands": {"upper": bands[0][index], "middle": bands[1][index], "lower": bands[2][index]},
+            "atr_14": atr_list[index],
         })
-
-    # --- Latest values (most recent non-NaN) ---
-    latest = {
-        "sma_20": sma20_list[-1],
-        "sma_50": sma50_list[-1],
-        "ema_20": ema20_list[-1],
-        "ema_50": ema50_list[-1],
-        "rsi_14": rsi14_list[-1],
-        "macd": {
-            "line": macd_line_list[-1],
-            "signal": signal_line_list[-1],
-            "histogram": macd_hist_list[-1],
-        },
-        "bollinger_bands": {
-            "upper": bb_upper_list[-1],
-            "middle": bb_middle_list[-1],
-            "lower": bb_lower_list[-1],
-        },
-        "atr_14": atr14_list[-1],
-    }
-
-    return {
-        "candle_count": n,
-        "latest": latest,
-        "series": series,
-    }
+    latest = {key: values[-1] for key, values in arrays.items()}
+    latest.update({
+        "macd": {"line": macd_values[0][-1], "signal": macd_values[1][-1], "histogram": macd_values[2][-1]},
+        "bollinger_bands": {"upper": bands[0][-1], "middle": bands[1][-1], "lower": bands[2][-1]},
+        "atr_14": atr_list[-1],
+    })
+    return {"candle_count": len(candles), "latest": latest, "series": series}
