@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import {
   Activity,
@@ -19,7 +19,7 @@ import { StatusBadge } from "@/components/ui/Primitives";
 import { useMarketContext } from "@/hooks/useMarketContext";
 
 const NAV_ITEMS = [
-  { to: "/", label: "Overview", index: "01", icon: LayoutGrid },
+  { to: "/overview", label: "Overview", index: "01", icon: LayoutGrid },
   { to: "/market-analysis", label: "Market Analysis", index: "02", icon: CandlestickChart },
   { to: "/signal-intelligence", label: "Signal Intelligence", index: "03", icon: Activity },
   { to: "/risk-management", label: "Risk Management", index: "04", icon: ShieldCheck },
@@ -42,7 +42,7 @@ export function AppShell() {
           <NavLink
             key={item.to}
             to={item.to}
-            end={item.to === "/"}
+            end
             onClick={onNavigate}
             className={({ isActive }) =>
               `group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
