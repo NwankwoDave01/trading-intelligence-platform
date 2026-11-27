@@ -5,7 +5,7 @@ from typing import Any
 
 from backend.app.analysis.market_structure.service import timeframe_to_milliseconds
 
-# Explicit directional contributions; totals are capped at +/- 10. A directional
+# Explicit directional contributions; totals are capped at +/- 12. A directional
 # signal requires aligned structure and at least three independent confirmations.
 WEIGHTS = {"trend": 3, "ema_alignment": 2, "price_vs_ema20": 1, "macd": 2, "rsi": 1, "recent_break": 2, "zone_context": 1}
 BUY_THRESHOLD = 6
@@ -77,7 +77,7 @@ def generate_signal(*, symbol: str, timeframe: str, candles: list[dict[str, Any]
     signal = "BUY" if direction > 0 and score >= BUY_THRESHOLD and confirmations >= 3 and not conflicts else "SELL" if direction < 0 and score <= SELL_THRESHOLD and confirmations >= 3 and not conflicts else "WAIT"
     if signal == "WAIT": reasons.append("MIXED_EVIDENCE_OR_BELOW_THRESHOLD")
     observations = {"close": close, "ema_20": latest["ema_20"], "ema_50": latest["ema_50"], "rsi_14": rsi, "macd": macd, "support_resistance_zones": structure["zones"]}
-    return {"symbol": symbol, "timeframe": timeframe, "signal": signal, "direction": "BULLISH" if signal == "BUY" else "BEARISH" if signal == "SELL" else "NEUTRAL", "score": score, "score_scale": [-12, 12], "strength": "strong" if abs(score) >= 8 and signal != "WAIT" else "moderate" if signal != "WAIT" else "none", "evaluation_timestamp": latest_available, "generated_at": generated_at, "trend": trend, "indicator_observations": observations, "structural_observations": {"recent_breaks": recent_events, "confirmed_swings": [s for s in structure["confirmed_swings"] if s["available_at"] <= latest_available]}, "reason_codes": reasons, "explanation": f"{signal}: structure is {trend}; weighted alignment score {score} on a -10 to +10 scale. This score is not a probability."}
+    return {"symbol": symbol, "timeframe": timeframe, "signal": signal, "direction": "BULLISH" if signal == "BUY" else "BEARISH" if signal == "SELL" else "NEUTRAL", "score": score, "score_scale": [-12, 12], "strength": "strong" if abs(score) >= 8 and signal != "WAIT" else "moderate" if signal != "WAIT" else "none", "evaluation_timestamp": latest_available, "generated_at": generated_at, "trend": trend, "indicator_observations": observations, "structural_observations": {"recent_breaks": recent_events, "confirmed_swings": [s for s in structure["confirmed_swings"] if s["available_at"] <= latest_available]}, "reason_codes": reasons, "explanation": f"{signal}: structure is {trend}; weighted alignment score {score} on a -12 to +12 scale. This score is not a probability."}
 
 
 def _wait(symbol, timeframe, candles, indicators, structure, generated_at, reasons, score):

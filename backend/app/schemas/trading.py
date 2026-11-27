@@ -62,4 +62,4 @@ class ClosePositionRequest(BaseModel):
 
 
 class MarkPriceRequest(BaseModel):
-    mark_price: Decimal = Field(gt=0, max_digits=20, decimal_places=8)
+    mark_price: Decimal = Field(gt=0, max_digits=20, decimal_places=8, allow_inf_nan=False)

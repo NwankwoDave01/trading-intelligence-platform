@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from backend.app.risk.service import preview_trade, MAX_OPEN_POSITIONS, MAX_AGGREGATE_OPEN_RISK_PERCENT
@@ -41,6 +41,32 @@ def _d(value): return D(str(value))
 def _dict(row): return dict(row) if row else None
 
 
+def _parse_positive_finite_decimal(value: Any, name: str) -> D:
+    try:
+        dec = _d(value)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a valid finite positive number.") from exc
+    if not dec.is_finite() or dec <= 0:
+        raise ValueError(f"{name} must be finite and positive.")
+    return dec
+
+
+def _position_worst_case_risk(position: sqlite3.Row | dict) -> D:
+    entry_fill = _d(position["entry_price"])
+    qty = _d(position["quantity"])
+    stop_loss = _d(position["stop_loss"])
+    slippage_rate = _d(position["slippage_rate"])
+    entry_fee = _d(position["entry_fee"])
+    if position["direction"] == "short":
+        stop_exit_fill = stop_loss * (D("1") + slippage_rate)
+        price_loss = (stop_exit_fill - entry_fill) * qty
+    else:
+        stop_exit_fill = stop_loss * (D("1") - slippage_rate)
+        price_loss = (entry_fill - stop_exit_fill) * qty
+    exit_fee = stop_exit_fill * qty * FEE_RATE
+    return max(D("0"), price_loss + entry_fee + exit_fee)
+
+
 def get_account():
     initialize()
     with LOCK, _connect() as db:
@@ -72,7 +98,7 @@ def _summary(account, positions):
         realised += _d(row["realised_pnl"] or 0)
         fees += _d(row["entry_fee"] or 0) + _d(row["exit_fee"] or 0)
     fees += sum((_d(p["entry_fee"]) for p in positions), D("0"))
-    open_risk = sum((max(D("0"), (_d(p["entry_price"]) - _d(p["stop_loss"])) * _d(p["quantity"])) for p in positions), D("0"))
+    open_risk = sum((_position_worst_case_risk(p) for p in positions), D("0"))
     return {"account_id": 1, "starting_balance": starting, "available_cash": cash, "equity": cash + open_value, "realised_pnl": realised, "unrealised_pnl": unrealised, "total_fees": fees, "total_return_percent": ((cash + open_value - starting) / starting * 100), "quote_currency": account["quote_currency"], "risk_percent": _d(account["risk_percent"]), "open_positions": [dict(p) for p in positions], "open_position_count": len(positions), "aggregate_open_risk": open_risk}
 
 
@@ -86,8 +112,8 @@ def preview_position(symbol: str, direction: str, entry: D, stop: D, target: D, 
         if not account: return {"accepted": False, "reason_code": "ACCOUNT_NOT_FOUND", "message": "Create a paper account first."}
         positions = _open_rows(db)
         equity = _d(account["cash"]) + sum((_d(p["mark_price"]) * _d(p["quantity"]) for p in positions), D("0"))
-        aggregate = sum((max(D("0"), (_d(p["entry_price"]) - _d(p["stop_loss"])) * _d(p["quantity"])) for p in positions), D("0"))
-        plan = preview_trade(direction=direction, entry=entry, stop_loss=stop, take_profit=target, equity=equity, available_cash=_d(account["cash"]), risk_percent=risk_percent or _d(account["risk_percent"]), open_positions=len(positions), aggregate_open_risk=aggregate, max_open_positions=MAX_OPEN_POSITIONS, max_aggregate_risk_percent=MAX_AGGREGATE_OPEN_RISK_PERCENT, fee_rate=FEE_RATE, max_notional=_d(account["cash"]))
+        aggregate = sum((_position_worst_case_risk(p) for p in positions), D("0"))
+        plan = preview_trade(direction=direction, entry=entry, stop_loss=stop, take_profit=target, equity=equity, available_cash=_d(account["cash"]), risk_percent=risk_percent or _d(account["risk_percent"]), open_positions=len(positions), aggregate_open_risk=aggregate, max_open_positions=MAX_OPEN_POSITIONS, max_aggregate_risk_percent=MAX_AGGREGATE_OPEN_RISK_PERCENT, fee_rate=FEE_RATE, slippage_rate=SLIPPAGE_RATE, max_notional=_d(account["cash"]))
         plan["symbol"] = symbol
         return plan
 
@@ -104,18 +130,26 @@ def open_position(symbol: str, entry: D, stop: D, target: D, idempotency_key: st
             db.rollback(); raise ValueError("Create a paper account first.")
         positions = _open_rows(db)
         equity = _d(account["cash"]) + sum((_d(p["mark_price"]) * _d(p["quantity"]) for p in positions), D("0"))
-        aggregate = sum((max(D("0"), (_d(p["entry_price"]) - _d(p["stop_loss"])) * _d(p["quantity"])) for p in positions), D("0"))
-        plan = preview_trade(direction="long", entry=entry, stop_loss=stop, take_profit=target, equity=equity, available_cash=_d(account["cash"]), risk_percent=risk_percent or _d(account["risk_percent"]), open_positions=len(positions), aggregate_open_risk=aggregate, max_open_positions=MAX_OPEN_POSITIONS, max_aggregate_risk_percent=MAX_AGGREGATE_OPEN_RISK_PERCENT, fee_rate=FEE_RATE, max_notional=_d(account["cash"]))
+        aggregate = sum((_position_worst_case_risk(p) for p in positions), D("0"))
+        plan = preview_trade(direction="long", entry=entry, stop_loss=stop, take_profit=target, equity=equity, available_cash=_d(account["cash"]), risk_percent=risk_percent or _d(account["risk_percent"]), open_positions=len(positions), aggregate_open_risk=aggregate, max_open_positions=MAX_OPEN_POSITIONS, max_aggregate_risk_percent=MAX_AGGREGATE_OPEN_RISK_PERCENT, fee_rate=FEE_RATE, slippage_rate=SLIPPAGE_RATE, max_notional=_d(account["cash"]))
         if not plan["accepted"]:
             db.rollback(); raise ValueError(f"{plan['reason_code']}: {plan['message']}")
         fill = entry * (D("1") + SLIPPAGE_RATE)
-        # Re-size against the actual adverse-slippage fill, including both-side fees.
+        stop_exit_fill = stop * (D("1") - SLIPPAGE_RATE)
+        # Re-size against actual adverse entry/stop slippage and both-side fees.
         budget = plan["cash_risk_budget"]
-        actual_unit_risk = (fill - stop) + fill * FEE_RATE * 2
+        actual_unit_risk = (fill - stop_exit_fill) + (fill * FEE_RATE) + (stop_exit_fill * FEE_RATE)
         risk_limited_qty = (budget / actual_unit_risk).quantize(D("0.00000001"), rounding=ROUND_DOWN)
         cash_limited_qty = (_d(account["cash"]) / (fill * (D("1") + FEE_RATE))).quantize(D("0.00000001"), rounding=ROUND_DOWN)
         qty = min(plan["position_quantity"], risk_limited_qty, cash_limited_qty)
         entry_fee = fill * qty * FEE_RATE
+        stop_exit_fee = stop_exit_fill * qty * FEE_RATE
+        estimated_loss = (fill - stop_exit_fill) * qty + entry_fee + stop_exit_fee
+        while estimated_loss > budget and qty > D("0"):
+            qty = max(D("0"), qty - D("0.00000001"))
+            entry_fee = fill * qty * FEE_RATE
+            stop_exit_fee = stop_exit_fill * qty * FEE_RATE
+            estimated_loss = (fill - stop_exit_fill) * qty + entry_fee + stop_exit_fee
         total = fill * qty + entry_fee
         if qty <= 0:
             db.rollback(); raise ValueError("POSITION_TOO_SMALL: Slippage leaves insufficient quantity at supported precision.")
@@ -143,13 +177,26 @@ def get_position(position_id: str):
 
 
 def mark_position(position_id: str, mark: D, candle_low: D | None = None, candle_high: D | None = None):
+    mark = _parse_positive_finite_decimal(mark, "mark_price")
+    if (candle_low is None) != (candle_high is None):
+        raise ValueError("Both candle_low and candle_high must be provided when either is supplied.")
+    if candle_low is not None and candle_high is not None:
+        low = _parse_positive_finite_decimal(candle_low, "candle_low")
+        high = _parse_positive_finite_decimal(candle_high, "candle_high")
+        if low > high:
+            raise ValueError("Candle low cannot exceed candle high.")
+        if not (low <= mark <= high):
+            raise ValueError("Mark price must be between candle low and candle high, inclusive.")
+    else:
+        low = mark
+        high = mark
+
     initialize()
     with LOCK, _connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
         if not row or row["status"] != "OPEN": db.rollback(); return _dict(row)
         db.execute("UPDATE positions SET mark_price=? WHERE id=?", (str(mark), position_id)); db.commit()
-    low, high = candle_low if candle_low is not None else mark, candle_high if candle_high is not None else mark
     if low <= _d(row["stop_loss"]): return close_position(position_id, _d(row["stop_loss"]), "stop_loss")
     if high >= _d(row["take_profit"]): return close_position(position_id, _d(row["take_profit"]), "take_profit")
     return get_position(position_id)

@@ -82,3 +82,125 @@ def test_signal_to_paper_portfolio_workflow(isolated_db, monkeypatch):
         assert client.get("/api/v1/paper/performance").json()["open_position_count"] == 0
     finally:
         app.dependency_overrides.clear()
+
+
+def test_stop_loss_risk_includes_entry_exit_slippage_and_both_fees(isolated_db):
+    service.create_account(D("10000"), "USD", D("1"))
+    preview = service.preview_position("BTC/USD", "long", D("100"), D("95"), D("110"))
+    assert preview["accepted"] is True
+
+    expected_entry_fill = D("100") * (D("1") + service.SLIPPAGE_RATE)
+    expected_stop_exit_fill = D("95") * (D("1") - service.SLIPPAGE_RATE)
+    expected_unit_risk = (
+        expected_entry_fill
+        - expected_stop_exit_fill
+        + expected_entry_fill * service.FEE_RATE
+        + expected_stop_exit_fill * service.FEE_RATE
+    )
+    assert preview["risk_per_unit"] == expected_unit_risk
+
+    position = service.open_position("BTC/USD", D("100"), D("95"), D("110"), "risk-sizing-0001")
+    qty = D(position["quantity"])
+    assert qty == preview["position_quantity"]
+    assert qty.as_tuple().exponent >= -8
+
+    closed = service.close_position(position["id"], D("95"), "stop_loss")
+    actual_loss = -D(closed["realised_pnl"])
+    assert actual_loss > D("0")
+    assert actual_loss <= D("100")
+    assert actual_loss == preview["estimated_max_loss_including_fees"]
+
+
+def test_aggregate_open_risk_includes_costs_and_blocks_cap_bypass(isolated_db):
+    service.create_account(D("10000"), "USD", D("2"))
+    pos1 = service.open_position("BTC/USD", D("100"), D("95"), D("115"), "agg-risk-0001", risk_percent=D("2"))
+    pos2 = service.open_position("ETH/USD", D("100"), D("95"), D("115"), "agg-risk-0002", risk_percent=D("2"))
+
+    account = service.get_account()
+    raw_price_risk = (
+        (D(pos1["entry_price"]) - D(pos1["stop_loss"])) * D(pos1["quantity"])
+        + (D(pos2["entry_price"]) - D(pos2["stop_loss"])) * D(pos2["quantity"])
+    )
+    assert account["aggregate_open_risk"] > raw_price_risk
+
+    # Without execution costs, raw_price_risk (~381.67) + 1.01% (~101) <= 500 cap;
+    # with execution costs, aggregate_open_risk (~400) + 1.01% (~101) > 500 cap.
+    assert raw_price_risk + D("101") <= D("500")
+    assert account["aggregate_open_risk"] + D("101") > D("500")
+    preview_over = service.preview_position("SOL/USD", "long", D("100"), D("95"), D("115"), risk_percent=D("1.01"))
+    assert preview_over["accepted"] is False
+    assert preview_over["reason_code"] == "MAX_AGGREGATE_OPEN_RISK"
+    with pytest.raises(ValueError, match="MAX_AGGREGATE_OPEN_RISK"):
+        service.open_position("SOL/USD", D("100"), D("95"), D("115"), "agg-risk-0003", risk_percent=D("1.01"))
+
+
+def test_buying_power_check_uses_slippage_adjusted_entry_fill_and_fee(isolated_db):
+    # Entry=100, stop=90, target=120, risk=100% -> budget would try to use full cash.
+    # With starting_balance=1000 and risk_percent=100, qty is limited by cash vs entry fill + entry fee.
+    # Verify that preview_trade rejects when cash covers requested entry + fee but not fill + fee.
+    from backend.app.risk.service import preview_trade
+    # If qty=10, requested entry*10*(1+0.001) = 1001, fill*10*(1+0.001) = 1001.5005
+    plan = preview_trade(
+        direction="long",
+        entry=D("100"),
+        stop_loss=D("90"),
+        take_profit=D("120"),
+        equity=D("10000"),
+        available_cash=D("1001.20"),
+        risk_percent=D("1.05"),
+        fee_rate=D("0.001"),
+        slippage_rate=D("0.0005"),
+    )
+    # Budget=105, unit_risk = 100.05 - 89.955 + 0.10005 + 0.089955 = 10.285005 -> qty ~10.209037
+    # Notional + entry_fee > 1001.20 -> must reject with INSUFFICIENT_BUYING_POWER
+    assert plan["accepted"] is False
+    assert plan["reason_code"] == "INSUFFICIENT_BUYING_POWER"
+
+
+def test_mark_position_validates_prices_and_candle_bounds_without_mutation(isolated_db):
+    service.create_account(D("10000"), "USD", D("1"))
+    position = service.open_position("BTC/USD", D("100"), D("95"), D("110"), "mark-val-0001")
+    initial_mark = position["mark_price"]
+
+    # Mark outside candle [low, high]
+    with pytest.raises(ValueError, match="between candle low and candle high"):
+        service.mark_position(position["id"], D("107"), candle_low=D("99"), candle_high=D("106"))
+    assert service.get_position(position["id"])["mark_price"] == initial_mark
+
+    # Only one of low / high supplied
+    with pytest.raises(ValueError, match="Both candle_low and candle_high"):
+        service.mark_position(position["id"], D("101"), candle_low=D("99"))
+    with pytest.raises(ValueError, match="Both candle_low and candle_high"):
+        service.mark_position(position["id"], D("101"), candle_high=D("105"))
+    assert service.get_position(position["id"])["mark_price"] == initial_mark
+
+    # low > high
+    with pytest.raises(ValueError, match="cannot exceed"):
+        service.mark_position(position["id"], D("101"), candle_low=D("105"), candle_high=D("99"))
+    assert service.get_position(position["id"])["mark_price"] == initial_mark
+
+    # Non-finite or non-positive prices
+    for bad in (D("0"), D("-5"), D("NaN"), D("Infinity")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            service.mark_position(position["id"], bad)
+        with pytest.raises(ValueError, match="finite and positive"):
+            service.mark_position(position["id"], D("101"), candle_low=bad, candle_high=D("105"))
+    assert service.get_position(position["id"])["mark_price"] == initial_mark
+
+    # API layer validation
+    client = TestClient(app)
+    assert client.post(f"/api/v1/paper/positions/{position['id']}/mark?low=99", json={"mark_price": "101"}).status_code == 422
+    assert client.post(f"/api/v1/paper/positions/{position['id']}/mark?low=99&high=103", json={"mark_price": "104"}).status_code == 422
+    assert client.post(f"/api/v1/paper/positions/{position['id']}/mark", json={"mark_price": "0"}).status_code == 422
+    assert client.post(f"/api/v1/paper/positions/{position['id']}/mark", json={"mark_price": "-10"}).status_code == 422
+    assert service.get_position(position["id"])["mark_price"] == initial_mark
+
+
+def test_take_profit_execution_remains_intact(isolated_db):
+    service.create_account(D("10000"), "USD", D("1"))
+    position = service.open_position("BTC/USD", D("100"), D("95"), D("110"), "tp-exec-0001")
+    closed = service.mark_position(position["id"], D("110"), candle_low=D("102"), candle_high=D("111"))
+    assert closed["status"] == "CLOSED"
+    assert closed["close_reason"] == "take_profit"
+    assert D(closed["exit_price"]) == D("110") * (D("1") - service.SLIPPAGE_RATE)
+    assert D(closed["realised_pnl"]) > D("0")
