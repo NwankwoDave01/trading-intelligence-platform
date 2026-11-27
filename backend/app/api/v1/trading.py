@@ -84,8 +84,21 @@ def get_paper_position(position_id: str):
 
 @router.post("/paper/positions/{position_id}/mark")
 def mark_paper_position(position_id: str, request: MarkPriceRequest, low: Decimal | None = Query(default=None, gt=0), high: Decimal | None = Query(default=None, gt=0)):
-    if low is not None and high is not None and low > high: raise HTTPException(422, "Candle low cannot exceed candle high.")
-    position = paper.mark_position(position_id, request.mark_price, low, high)
+    if not request.mark_price.is_finite() or request.mark_price <= 0:
+        raise HTTPException(422, "Mark price must be finite and positive.")
+    if (low is None) != (high is None):
+        raise HTTPException(422, "Both candle low and candle high must be supplied together.")
+    if low is not None and high is not None:
+        if not low.is_finite() or low <= 0 or not high.is_finite() or high <= 0:
+            raise HTTPException(422, "Candle low and candle high must be finite and positive.")
+        if low > high:
+            raise HTTPException(422, "Candle low cannot exceed candle high.")
+        if not (low <= request.mark_price <= high):
+            raise HTTPException(422, "Mark price must be between candle low and candle high, inclusive.")
+    try:
+        position = paper.mark_position(position_id, request.mark_price, low, high)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if not position: raise HTTPException(404, "Paper position not found.")
     return position
 

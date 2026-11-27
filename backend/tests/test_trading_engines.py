@@ -22,6 +22,9 @@ def test_signal_bullish_and_schema():
     result = generate_signal(symbol="BTC/USD", timeframe="1h", candles=candles, indicators=indicators, structure=structure, generated_at=9_000_000)
     assert result["signal"] == "BUY"
     assert result["score"] >= 6
+    assert result["score_scale"] == [-12, 12]
+    assert "-12 to +12" in result["explanation"]
+    assert "-10 to +10" not in result["explanation"]
     SignalResponse(**result)
 
 
