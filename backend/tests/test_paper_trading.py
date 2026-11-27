@@ -204,3 +204,69 @@ def test_take_profit_execution_remains_intact(isolated_db):
     assert closed["close_reason"] == "take_profit"
     assert D(closed["exit_price"]) == D("110") * (D("1") - service.SLIPPAGE_RATE)
     assert D(closed["realised_pnl"]) > D("0")
+
+
+def test_close_position_uses_stored_slippage_rate_not_global_default(isolated_db, monkeypatch):
+    import json
+
+    service.create_account(D("10000"), "USD", D("1"))
+    position = service.open_position("BTC/USD", D("100"), D("95"), D("110"), "stored-slip-0001")
+    stored_slippage = D(position["slippage_rate"])
+    assert stored_slippage == D("0.0005")
+
+    qty = D(position["quantity"])
+    entry_fill = D(position["entry_price"])
+    entry_fee = D(position["entry_fee"])
+    cash_after_open = service.get_account()["available_cash"]
+
+    # Mutate global SLIPPAGE_RATE after opening; closing must still use stored_slippage.
+    monkeypatch.setattr(service, "SLIPPAGE_RATE", D("0.02"))
+
+    # Also verify aggregate open risk still uses stored_slippage, not mutated global.
+    expected_stop_exit = D("95") * (D("1") - stored_slippage)
+    expected_open_risk = (entry_fill - expected_stop_exit) * qty + entry_fee + expected_stop_exit * qty * service.FEE_RATE
+    assert service.get_account()["aggregate_open_risk"] == expected_open_risk
+
+    requested_exit = D("108")
+    closed = service.close_position(position["id"], requested_exit, "manual")
+
+    expected_exit_price = requested_exit * (D("1") - stored_slippage)
+    expected_exit_fee = expected_exit_price * qty * service.FEE_RATE
+    expected_proceeds = expected_exit_price * qty - expected_exit_fee
+    expected_realised_pnl = (expected_exit_price - entry_fill) * qty - entry_fee - expected_exit_fee
+
+    assert closed["status"] == "CLOSED"
+    assert D(closed["exit_price"]) == expected_exit_price
+    assert D(closed["exit_fee"]) == expected_exit_fee
+    assert D(closed["realised_pnl"]) == expected_realised_pnl
+
+    account_after_close = service.get_account()
+    assert account_after_close["available_cash"] == cash_after_open + expected_proceeds
+    assert account_after_close["realised_pnl"] == expected_realised_pnl
+
+    entries = service.ledger(position["id"])
+    assert len(entries) == 2
+    close_details = json.loads(entries[1]["details"])
+    assert D(entries[1]["amount"]) == expected_proceeds
+    assert D(close_details["fill"]) == expected_exit_price
+    assert D(close_details["fee"]) == expected_exit_fee
+    assert D(close_details["slippage_rate"]) == stored_slippage
+    assert D(close_details["net_pnl"]) == expected_realised_pnl
+
+
+def test_close_position_fallback_when_slippage_rate_empty_or_missing(isolated_db):
+    service.create_account(D("10000"), "USD", D("1"))
+    position = service.open_position("BTC/USD", D("100"), D("95"), D("110"), "legacy-slip-0001")
+
+    # Simulate a legacy row where slippage_rate is empty string.
+    with service._connect() as db:
+        db.execute("UPDATE positions SET slippage_rate='' WHERE id=?", (position["id"],))
+        db.commit()
+
+    closed = service.close_position(position["id"], D("105"), "manual")
+    expected_exit_price = D("105") * (D("1") - service.SLIPPAGE_RATE)
+    assert D(closed["exit_price"]) == expected_exit_price
+
+    # Also verify _position_slippage_rate handles a dict missing the key altogether.
+    legacy_dict = {k: v for k, v in position.items() if k != "slippage_rate"}
+    assert service._position_slippage_rate(legacy_dict) == service.SLIPPAGE_RATE

@@ -51,11 +51,16 @@ def _parse_positive_finite_decimal(value: Any, name: str) -> D:
     return dec
 
 
+def _position_slippage_rate(position: sqlite3.Row | dict) -> D:
+    raw = position["slippage_rate"] if "slippage_rate" in position.keys() else None
+    return _d(raw) if raw not in (None, "") else SLIPPAGE_RATE
+
+
 def _position_worst_case_risk(position: sqlite3.Row | dict) -> D:
     entry_fill = _d(position["entry_price"])
     qty = _d(position["quantity"])
     stop_loss = _d(position["stop_loss"])
-    slippage_rate = _d(position["slippage_rate"])
+    slippage_rate = _position_slippage_rate(position)
     entry_fee = _d(position["entry_fee"])
     if position["direction"] == "short":
         stop_exit_fill = stop_loss * (D("1") + slippage_rate)
@@ -176,6 +181,54 @@ def get_position(position_id: str):
         return _dict(db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone())
 
 
+def _close_position_in_tx(db: sqlite3.Connection, position_id: str, requested_exit: D, reason: str) -> dict | None:
+    row = db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
+    if not row:
+        return None
+    if row["status"] == "CLOSED":
+        return dict(row)
+    # Stop/target execution uses adverse slippage; if both OHLC levels occur,
+    # stop-loss is chosen first by mark_position (conservative deterministic policy).
+    position_slippage = _position_slippage_rate(row)
+    qty = _d(row["quantity"])
+    entry = _d(row["entry_price"])
+    if row["direction"] == "short":
+        exit_price = requested_exit * (D("1") + position_slippage)
+        exit_fee = exit_price * qty * FEE_RATE
+        net = (entry - exit_price) * qty - _d(row["entry_fee"]) - exit_fee
+        proceeds = entry * qty + (entry - exit_price) * qty - exit_fee
+    else:
+        exit_price = requested_exit * (D("1") - position_slippage)
+        exit_fee = exit_price * qty * FEE_RATE
+        proceeds = exit_price * qty - exit_fee
+        net = (exit_price - entry) * qty - _d(row["entry_fee"]) - exit_fee
+    now = _now()
+    account = db.execute("SELECT cash FROM accounts WHERE id=1").fetchone()
+    db.execute("UPDATE accounts SET cash=? WHERE id=1", (str(_d(account["cash"]) + proceeds),))
+    db.execute(
+        "UPDATE positions SET status='CLOSED',exit_price=?,exit_fee=?,realised_pnl=?,close_reason=?,mark_price=? WHERE id=?",
+        (str(exit_price), str(exit_fee), str(net), reason, str(exit_price), position_id),
+    )
+    db.execute(
+        "INSERT INTO ledger(position_id,kind,amount,details,created_at) VALUES(?,?,?,?,?)",
+        (
+            position_id,
+            "CLOSE",
+            str(proceeds),
+            json.dumps({
+                "requested_exit": str(requested_exit),
+                "fill": str(exit_price),
+                "fee": str(exit_fee),
+                "slippage_rate": str(position_slippage),
+                "net_pnl": str(net),
+                "reason": reason,
+            }),
+            now,
+        ),
+    )
+    return dict(db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone())
+
+
 def mark_position(position_id: str, mark: D, candle_low: D | None = None, candle_high: D | None = None):
     mark = _parse_positive_finite_decimal(mark, "mark_price")
     if (candle_low is None) != (candle_high is None):
@@ -195,34 +248,32 @@ def mark_position(position_id: str, mark: D, candle_low: D | None = None, candle
     with LOCK, _connect() as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
-        if not row or row["status"] != "OPEN": db.rollback(); return _dict(row)
-        db.execute("UPDATE positions SET mark_price=? WHERE id=?", (str(mark), position_id)); db.commit()
-    if low <= _d(row["stop_loss"]): return close_position(position_id, _d(row["stop_loss"]), "stop_loss")
-    if high >= _d(row["take_profit"]): return close_position(position_id, _d(row["take_profit"]), "take_profit")
-    return get_position(position_id)
+        if not row or row["status"] != "OPEN":
+            db.rollback()
+            return _dict(row)
+        db.execute("UPDATE positions SET mark_price=? WHERE id=?", (str(mark), position_id))
+        if low <= _d(row["stop_loss"]):
+            closed = _close_position_in_tx(db, position_id, _d(row["stop_loss"]), "stop_loss")
+            db.commit()
+            return closed
+        if high >= _d(row["take_profit"]):
+            closed = _close_position_in_tx(db, position_id, _d(row["take_profit"]), "take_profit")
+            db.commit()
+            return closed
+        db.commit()
+        return dict(db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone())
 
 
 def close_position(position_id: str, requested_exit: D, reason: str = "manual"):
     initialize()
     with LOCK, _connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        row = db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
-        if not row: db.rollback(); return None
-        if row["status"] == "CLOSED": db.commit(); return dict(row)
-        # Stop/target execution uses adverse slippage; if both OHLC levels occur,
-        # stop-loss is chosen first by mark_position (conservative deterministic policy).
-        exit_price = requested_exit * (D("1") - SLIPPAGE_RATE)
-        qty = _d(row["quantity"]); entry = _d(row["entry_price"])
-        exit_fee = exit_price * qty * FEE_RATE
-        proceeds = exit_price * qty - exit_fee
-        net = (exit_price - entry) * qty - _d(row["entry_fee"]) - exit_fee
-        now = _now()
-        account = db.execute("SELECT cash FROM accounts WHERE id=1").fetchone()
-        db.execute("UPDATE accounts SET cash=? WHERE id=1", (str(_d(account["cash"]) + proceeds),))
-        db.execute("UPDATE positions SET status='CLOSED',exit_price=?,exit_fee=?,realised_pnl=?,close_reason=?,mark_price=? WHERE id=?", (str(exit_price),str(exit_fee),str(net),reason,str(exit_price),position_id))
-        db.execute("INSERT INTO ledger(position_id,kind,amount,details,created_at) VALUES(?,?,?,?,?)", (position_id,"CLOSE",str(proceeds),json.dumps({"requested_exit":str(requested_exit),"fill":str(exit_price),"fee":str(exit_fee),"net_pnl":str(net),"reason":reason}),now))
+        closed = _close_position_in_tx(db, position_id, requested_exit, reason)
+        if not closed:
+            db.rollback()
+            return None
         db.commit()
-        return dict(db.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone())
+        return closed
 
 
 def history():
